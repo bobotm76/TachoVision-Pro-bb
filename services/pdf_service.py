@@ -562,7 +562,7 @@ def generate_violations_pdf(cd: CardData) -> bytes:
       - Colore cella = colore della severità corrispondente
     """
     buf   = io.BytesIO()
-    viols = detect_violations(cd.activities)   # lista Violation
+    viols = detect_violations(cd.activities, cd.vehicle_sessions)   # lista Violation
     vs    = violation_summary(viols)            # {SEV_VERY: N, SEV_HIGH: N, SEV_LOW: N, "total": N}
     period = _period(cd.activities)
 

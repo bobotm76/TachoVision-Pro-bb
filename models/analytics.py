@@ -155,6 +155,38 @@ def compute_weekly_summary(activities: List[DayActivity]) -> List[WeekSummary]:
     return result
 
 
+def _merge_continuous_rest_periods(activities: List[DayActivity]) -> List[tuple[datetime, datetime]]:
+    """
+    Unisce i segmenti di Riposo contigui o adiacenti anche se sono stati registrati
+    in due giorni diversi (es. fine giorno N e inizio giorno N+1).
+
+    Questo è fondamentale perché un riposo valido può continuare oltre mezzanotte e
+    non va mai trattato come due riposi separati per la regola giornaliera.
+    """
+    periods = []
+    for day in sorted(activities, key=lambda d: d.date):
+        base = datetime.strptime(day.date, "%Y-%m-%d")
+        for s, e, a in day.segments():
+            if a != "Riposo":
+                continue
+            periods.append((base + timedelta(minutes=s), base + timedelta(minutes=e)))
+
+    if not periods:
+        return []
+
+    periods.sort(key=lambda p: p[0])
+    merged = [[periods[0][0], periods[0][1]]]
+    for start, end in periods[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + timedelta(minutes=1):
+            merged[-1][1] = max(prev_end, end)
+        else:
+            merged.append([start, end])
+
+    return [(datetime.fromisoformat(s.isoformat()), datetime.fromisoformat(e.isoformat()))
+            for s, e in merged]
+
+
 def compute_rest_periods(activities: List[DayActivity]) -> List[RestPeriod]:
     """
     Identifica e classifica i periodi di riposo nel periodo di attività.
@@ -175,41 +207,31 @@ def compute_rest_periods(activities: List[DayActivity]) -> List[RestPeriod]:
     """
     rests: List[RestPeriod] = []
 
-    # Processa i giorni in ordine cronologico (necessario per correttezza)
-    for day in sorted(activities, key=lambda d: d.date):
-        # Mezzanotte UTC del giorno (es. datetime(2026, 5, 9, 0, 0, 0))
-        base = datetime.strptime(day.date, "%Y-%m-%d")
+    for start_dt, end_dt in _merge_continuous_rest_periods(activities):
+        dur = int((end_dt - start_dt).total_seconds() // 60)
+        if dur < 45:
+            continue
 
-        for s, e, a in day.segments():
-            if a != "Riposo":
-                continue   # considera solo i segmenti di riposo
+        h, m = divmod(dur, 60)
 
-            dur = e - s   # durata in minuti
+        if dur >= 2700:
+            kind = "Settimanale"
+        elif dur >= 660:
+            kind = "Regolare"
+        elif dur >= 540:
+            kind = "Ridotto"
+        else:
+            kind = "Breve"
 
-            if dur < 45:
-                continue   # troppo breve per essere un riposo significativo
+        rests.append(RestPeriod(
+            date=start_dt.strftime("%Y-%m-%d"),
+            start=start_dt.strftime("%d/%m/%Y %H:%M"),
+            end=end_dt.strftime("%d/%m/%Y %H:%M"),
+            duration_min=dur,
+            duration_str=f"{h}h{m:02d}",
+            kind=kind,
+        ))
 
-            # Calcola ore e minuti per il formato "Xh YY"
-            h, m = divmod(dur, 60)
-
-            # Classifica in base alla durata
-            if   dur >= 2700: kind = "Settimanale"
-            elif dur >= 660:  kind = "Regolare"
-            elif dur >= 540:  kind = "Ridotto"
-            else:             kind = "Breve"
-
-            rests.append(RestPeriod(
-                date=day.date,
-                # Calcola ora inizio: mezzanotte + s minuti
-                start=(base + timedelta(minutes=s)).strftime("%d/%m/%Y %H:%M"),
-                # Calcola ora fine: mezzanotte + e minuti
-                end=  (base + timedelta(minutes=e)).strftime("%d/%m/%Y %H:%M"),
-                duration_min=dur,
-                duration_str=f"{h}h{m:02d}",   # es. "11h00"
-                kind=kind,
-            ))
-
-    # Ritorna dalla più recente alla più vecchia (come le altre liste)
     return sorted(rests, key=lambda r: r.date, reverse=True)
 
 

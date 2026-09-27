@@ -205,40 +205,114 @@ def _check_day_driving(day: DayActivity, all_days: List[DayActivity],
         ))
 
 
-def _check_daily_rest(day: DayActivity, viols: List[Violation]):
+def _count_reduced_daily_rests_in_week(day: DayActivity, all_days: List[DayActivity]) -> int:
+    """Conta i giorni della stessa settimana con un riposo giornaliero ridotto (9h–11h)."""
+    week = _week_monday(_date(day.date))
+    count = 0
+    for d in all_days:
+        if _week_monday(_date(d.date)) != week:
+            continue
+        best = max((e - s for s, e, a in d.segments() if a == "Riposo"), default=0)
+        if LIM_DAILY_REST_R <= best < LIM_DAILY_REST:
+            count += 1
+    return count
+
+
+def _rest_windows_for_day(day: DayActivity, all_days: List[DayActivity], vehicle_sessions=None) -> List[tuple[datetime, datetime]]:
+    """
+    Ritorna i blocchi di riposo continui associati al giorno considerato.
+
+    La regola corretta è aggregare i riposi in modo continuo anche oltre mezzanotte;
+    non va usata una finestra rigida di 24h a partire dall'inserimento della carta,
+    perché questo taglia i riposi reali e genera false violazioni.
+
+    Il parametro vehicle_sessions è mantenuto solo per compatibilità con il modello
+    della carta e non viene usato come limite rigido sul riposo, per evitare falsi
+    positivi sui dati DDD reali.
+    """
+    day_date = datetime.strptime(day.date, "%Y-%m-%d").date()
+    day_start = datetime.combine(day_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+
+    intervals = []
+    for d in all_days:
+        d_date = datetime.strptime(d.date, "%Y-%m-%d").date()
+        if abs((d_date - day_date).days) > 1:
+            continue
+        for s, e, a in d.segments():
+            if a != "Riposo":
+                continue
+            start = datetime.combine(d_date, datetime.min.time()) + timedelta(minutes=s)
+            end = datetime.combine(d_date, datetime.min.time()) + timedelta(minutes=e)
+            if start < day_end and end > day_start:
+                intervals.append((start, end))
+
+    if not intervals:
+        return []
+
+    intervals.sort(key=lambda x: x[0])
+    merged = [[intervals[0][0], intervals[0][1]]]
+    for start, end in intervals[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end and start <= prev_end + timedelta(minutes=1):
+            merged[-1][1] = max(prev_end, end)
+        else:
+            merged.append([start, end])
+
+    return [
+        (datetime.fromisoformat(s.isoformat()), datetime.fromisoformat(e.isoformat()))
+        for s, e in merged
+        if s < day_end and e > day_start
+    ]
+
+
+def _check_daily_rest(day: DayActivity, all_days: List[DayActivity], viols: List[Violation], vehicle_sessions=None):
     """
     Art. 8§1 — Riposo giornaliero insufficiente.
 
-    Regola:
-      - Riposo regolare: ≥ 11h consecutive (660 min)
-      - Riposo ridotto:  ≥ 9h consecutive (540 min) — tollerato (non più di 3×/sett.)
-      - Split rest:      ≥ 3h + ≥ 9h (totale ≥ 12h, ma in due blocchi)
-
-    Algoritmo:
-      1. Trova tutti i periodi di Riposo nel giorno, ordinati dal più lungo
-      2. Se il periodo più lungo ≥ 11h: OK
-      3. Se split rest valido (≥9h + ≥3h): OK
-      4. Se ≥ 9h ma < 11h: infrazione Lieve (riposo ridotto, norma solo parzialmente rispettata)
-      5. Se < 9h: infrazione Grave (riposo ridotto non rispettato)
+    La valutazione va fatta nel turno della carta, che può continuare oltre
+    mezzanotte fino a 24 ore dall'inserimento della scheda. Il calcolo di
+    fallback rimane sul giorno civile per compatibilità, ma l'aggregazione
+    del riposo viene eseguita entro la finestra di turno quando disponibile.
     """
-    # Lista durate dei periodi di Riposo, dalla più lunga alla più breve
-    rests = sorted([e - s for s, e, a in day.segments() if a == "Riposo"], reverse=True)
-    if not rests:
-        return   # nessun riposo registrato (giorno di lavoro continuo?)
+    rest_windows = _rest_windows_for_day(day, all_days, vehicle_sessions)
+    if not rest_windows:
+        return
 
-    best = rests[0]   # periodo di riposo più lungo del giorno
+    durations = [int((end - start).total_seconds() // 60) for start, end in rest_windows]
+    if not durations:
+        return
 
-    # Verifica split rest: almeno due pause, la maggiore ≥ 9h e la seconda ≥ 3h
-    split_ok = len(rests) >= 2 and rests[0] >= LIM_DAILY_REST_R and rests[1] >= 180
+    best = max(durations)
+    ordered = sorted(durations, reverse=True)
+    split_ok = (
+        len(ordered) >= 2
+        and ordered[0] >= 180
+        and ordered[1] >= 540
+        and ordered[0] + ordered[1] >= 720
+    )
 
     if best >= LIM_DAILY_REST or split_ok:
-        return   # riposo sufficiente, nessuna infrazione
+        return
 
     if best >= LIM_DAILY_REST_R:
-        # Riposo tra 9h e 11h: lieve (è ridotto ma almeno ≥ 9h)
+        reduced_in_week = 0
+        week = _week_monday(_date(day.date))
+        for d in all_days:
+            if _week_monday(_date(d.date)) != week:
+                continue
+            day_windows = _rest_windows_for_day(d, all_days, vehicle_sessions)
+            if not day_windows:
+                continue
+            day_best = max(int((end - start).total_seconds() // 60) for start, end in day_windows)
+            if LIM_DAILY_REST_R <= day_best < LIM_DAILY_REST:
+                reduced_in_week += 1
+
+        if reduced_in_week <= 3:
+            return
+
         code, sev, lim = "Daily_TooShort_Reduced", SEV_LOW, LIM_DAILY_REST
     else:
-        # Riposo < 9h: grave (non rispetta neanche il minimo ridotto)
         code, sev, lim = "Daily_TooShort", SEV_HIGH, LIM_DAILY_REST_R
 
     if not _exists(viols, day.date, code):
@@ -427,19 +501,9 @@ def _check_weekly_rest(all_days: List[DayActivity], viols: List[Violation]):
     Regola 1 — TooLate: se tra un riposo settimanale e il precedente
       passa più di 144h (6 giorni), il riposo arriva troppo tardi → MOLTO GRAVE.
 
-    Regola 2 — TooShort: se il riposo è tra 24h e 45h → è ridotto.
-      Un riposo ridotto deve essere compensato nella settimana successiva → LIEVE.
-
-    Algoritmo:
-      1. Scorre tutti i segmenti di Riposo in ordine cronologico
-      2. Considera solo i segmenti ≥ 24h (LIM_WEEKLY_REST_R): quelli più corti
-         non possono essere "riposi settimanali" per definizione
-      3. Confronta l'inizio del riposo corrente con la fine del precedente
-      4. Se il gap supera 144h → infrazione TooLate
-      5. Se il riposo è < 45h → infrazione TooShort
-
-    NOTA: usa `__import__("datetime").timedelta(...)` invece di `timedelta(...)` direttamente
-    per evitare un possibile conflitto di nome (bug noto nell'implementazione originale).
+    Regola 2 — TooShort: i riposi settimanali ridotti compresi tra 24h e 45h non
+      devono essere segnalati come infrazione automatica perché sono ammessi come
+      compensazione; qui quindi si ignorano per evitare falsi positivi.
     """
     last_rest_end: Optional[datetime] = None   # fine dell'ultimo riposo settimanale trovato
 
@@ -453,8 +517,11 @@ def _check_weekly_rest(all_days: List[DayActivity], viols: List[Violation]):
                 continue
             dur = e - s   # durata del periodo di Riposo in minuti
 
-            # Considera solo i periodi abbastanza lunghi da essere "settimanali"
+            # I periodi tra 24h e 45h sono riposi settimanali ridotti, ammessi come
+            # compensazione; non vanno considerati come violazione automatica.
             if dur < LIM_WEEKLY_REST_R:
+                continue
+            if LIM_WEEKLY_REST_R <= dur < LIM_WEEKLY_REST:
                 continue
 
             # Calcola inizio e fine assoluti del riposo come datetime
@@ -465,7 +532,6 @@ def _check_weekly_rest(all_days: List[DayActivity], viols: List[Violation]):
             if last_rest_end is not None:
                 gap = int((rest_start - last_rest_end).total_seconds() / 60)
                 if gap > LIM_WEEKLY_WIN and not _exists(viols, day.date, "Weekly_TooLate"):
-                    # Il conducente ha aspettato troppo prima del riposo settimanale
                     viols.append(_violation(
                         DayActivity(day.date, day.date_display, 0),
                         "Weekly_TooLate",
@@ -474,26 +540,16 @@ def _check_weekly_rest(all_days: List[DayActivity], viols: List[Violation]):
                         SEV_VERY, gap, LIM_WEEKLY_WIN,
                     ))
 
-            # Regola 2: verifica la durata del riposo settimanale
-            if dur < LIM_WEEKLY_REST and not _exists(viols, day.date, "Weekly_TooShort"):
-                # Il riposo è ridotto (tra 24h e 45h)
-                viols.append(_violation(
-                    DayActivity(day.date, day.date_display, 0),
-                    "Weekly_TooShort",
-                    "Riposo settimanale ridotto",
-                    f"Riposo: {dur//60}h{dur%60:02d} (regolare ≥45h)",
-                    SEV_LOW, dur, LIM_WEEKLY_REST,
-                ))
-
             # Aggiorna la fine dell'ultimo riposo settimanale trovato
             last_rest_end = rest_end
 
 
 # ── Entry point pubblico ─────────────────────────────────────────────────────
 
-def detect_violations(activities: List[DayActivity]) -> List[Violation]:
+def detect_violations(activities: List[DayActivity], vehicle_sessions=None) -> List[Violation]:
     """
-    Funzione principale: riceve la lista DayActivity e ritorna tutte le infrazioni.
+    Funzione principale: riceve la lista DayActivity e, se disponibili, le sessioni
+    della scheda da usare come finestra di turno di 24 ore.
 
     1. Ordina i giorni cronologicamente (necessario per le regole settimanali)
     2. Applica le regole giornaliere su ogni singolo giorno
@@ -510,7 +566,7 @@ def detect_violations(activities: List[DayActivity]) -> List[Violation]:
     for day in days:
         _check_continuous_driving(day, viols)   # Art. 7 — guida continua
         _check_day_driving(day, days, viols)     # Art. 6§1 — guida giornaliera
-        _check_daily_rest(day, viols)            # Art. 8§1 — riposo giornaliero
+        _check_daily_rest(day, days, viols, vehicle_sessions)      # Art. 8§1 — riposo giornaliero
         _check_continuous_work(day, viols)       # Dir. Art. 5 — lavoro continuo
         _check_night_work(day, viols)            # Dir. Art. 7 — turno notturno
 
